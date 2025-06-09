@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Body
 from typing import Dict, Any, List, Optional, Union
-import pymongo
+import pymongo 
 import uuid
 import random
 import utils
@@ -9,10 +9,13 @@ import tempfile
 import os
 from bson import ObjectId
 import datetime
+from type_based_bkt_system import TypeBasedPhysioTherapyBKT
 
 # MongoDB 
 mongo_client = pymongo.MongoClient("mongodb://localhost:27017/")
 db = mongo_client["physical_therapy_questions"]
+bkt_system = TypeBasedPhysioTherapyBKT(mongo_client)
+
 
 exam_router = APIRouter(prefix="/api/exam", tags=["exam"])
 
@@ -313,54 +316,60 @@ async def get_level_test():
         raise HTTPException(status_code=500, detail=f"Error processing diagnosis test:  {str(e)}")
 
 
-# Diagnosis test submission endpoint
 @exam_router.post("/submit-test")
-async def submit_test(submission: TestSubmission):
-    """
-    This endpoint processes the diagnosis test submission. Saving the results to the database and calculating the score.
-    """
+async def submit_test_with_bkt_fixed(submission: TestSubmission):
+    """BKT entegreli + detailed_results koruyan + test history düzeltilmiş versiyon"""
     try:
-        # Doğru koleksiyon adını kullan
         collection = db["diagnosis_test"]
         user_collection = db["users"]
         
-        # Debug bilgisi - gelen verileri logla
-        print(f"Gelen istek: user_id={submission.user_id}, yanıt sayısı={len(submission.answers)}")
+        print(f"🔍 BKT Test Submission: user_id={submission.user_id}")
         
-        # Veritabanından soruları çek
         questions = []
-        for question_id, answer in submission.answers.items():
-            # String ID ile ara
+        bkt_updates = []
+        
+        for question_id, student_answer in submission.answers.items():
+            # 문제 찾기
             question = collection.find_one({"_id": question_id})
-            
-            # Bulunamadıysa farklı yollar dene
             if not question:
                 try:
-                    # ObjectId ile dene
                     obj_id = ObjectId(question_id)
                     question = collection.find_one({"_id": obj_id})
-                    
-                    if question:
-                        print(f"Soru ObjectId ile bulundu: {question_id}")
                 except:
-                    print(f"ObjectId dönüşümü başarısız: {question_id}")
+                    pass
             
             if question:
                 questions.append(question)
-            else:
-                print(f"UYARI: Soru bulunamadı: {question_id}")
+                
+                # 정답 확인
+                correct_answer = question.get("Answer Key", question.get("answer_key"))
+                is_correct = student_answer == correct_answer
+                
+                # BKT UPDATE (선택적 - hata olursa devam et)
+                try:
+                    bkt_result = bkt_system.update_bkt_with_answer(
+                        user_id=submission.user_id,
+                        question_data={
+                            "type": question.get("type", "general"),
+                            "difficulty": question.get("difficulty", "중"),
+                        },
+                        student_answer=student_answer,
+                        is_correct=is_correct
+                    )
+                    bkt_updates.append(bkt_result)
+                    print(f"✅ BKT Updated: {bkt_result['type']} → {bkt_result['updated_mastery']:.3f}")
+                    
+                except Exception as bkt_error:
+                    print(f"⚠️ BKT update failed for {question_id}: {str(bkt_error)}")
+                    # BKT hatası olsa da test değerlendirmesi devam etsin
         
-        print(f"Bulunan toplam soru: {len(questions)}")
-        
-        # Score calculation
+        # 기존 점수 계산
         score_result = utils.real_calculate_score(submission.answers, questions)
         
-        # Detaylı test sonuçlarını hazırla
+        # DETAILED RESULTS - ESKİ FORMAT (BU MUTLAKA OLMALI)
         detailed_results = []
         for result in score_result["results"]:
             question_id = result["question_id"]
-            
-            # Soruyu bul
             question_info = next((q for q in questions if str(q.get("_id")) == question_id), None)
             
             if question_info:
@@ -372,98 +381,157 @@ async def submit_test(submission: TestSubmission):
                     "student_answer": result["student_answer"],
                     "is_correct": result["correct"],
                     "points_earned": result["points"],
-                    "difficulty": question_info.get("difficulty", "하")
+                    "difficulty": question_info.get("difficulty", "하"),
+                    "type": question_info.get("type", "general")
                 }
                 detailed_results.append(detailed_result)
         
-        # Test sonuçlarını users koleksiyonuna kaydet
+        print(f"📋 Created detailed_results: {len(detailed_results)} questions")
+        
+        # BKT level adjustment (선택적)
+        final_level = score_result["level"]  # Default
+        overall_mastery = 0
+        weak_types_summary = []
+        strong_types_summary = []
+        
+        try:
+            if bkt_updates:  # BKT güncellemesi varsa
+                mastery_report = bkt_system.get_mastery_report(submission.user_id)
+                overall_mastery = mastery_report["overall_mastery"]
+                
+                # Level adjustment
+                combined_score = (score_result["score"] * 0.7) + (overall_mastery * 100 * 0.3)
+                
+                if combined_score >= 75:
+                    final_level = "상"
+                elif combined_score >= 55:
+                    final_level = "중"
+                else:
+                    final_level = "하"
+                
+                print(f"📊 BKT Level: {score_result['level']} → {final_level} (mastery: {overall_mastery:.3f})")
+                
+                # Weak/strong types summary
+                if mastery_report.get("weak_types"):
+                    for type_name, type_data in mastery_report["weak_types"]:
+                        weak_types_summary.append({
+                            "type": type_name,
+                            "mastery": type_data["mastery_probability"]
+                        })
+                
+                if mastery_report.get("strong_types"):
+                    for type_name, type_data in mastery_report["strong_types"]:
+                        strong_types_summary.append({
+                            "type": type_name,
+                            "mastery": type_data["mastery_probability"]
+                        })
+            
+        except Exception as bkt_level_error:
+            print(f"⚠️ BKT level calculation failed: {str(bkt_level_error)}")
+            # BKT hatası olsa da normal seviye kullanılır
+        
+        # ⭐ CRITICAL FIX: TEST RECORD - detailed_results dahil şekilde
         test_record = {
-            "test_date": datetime.datetime.utcnow(),
-            "test_type": "level_test",
+            "test_date": datetime.datetime.now(),
+            "test_type": "level_test_with_bkt" if bkt_updates else "level_test",
             "total_score": score_result["score"],
-            "level": score_result["level"],
+            "level": final_level,
             "correct_count": score_result["correct_count"],
-            "total_questions": len(submission.answers),
-            "detailed_results": detailed_results
+            "total_questions": len(questions),  # ⭐ Gerçek soru sayısı
+            "detailed_results": detailed_results  # ⭐ BU MUTLAKA OLMALI
         }
         
-        print(f"💾 Kaydedilecek test verisi: {test_record}")
+        # BKT bilgileri varsa ekle
+        if bkt_updates:
+            test_record["bkt_analysis"] = {
+                "overall_mastery": overall_mastery,
+                "type_updates": len(bkt_updates),
+                "weak_types": weak_types_summary,
+                "strong_types": strong_types_summary,
+                "total_types_tracked": len(set([upd.get("type") for upd in bkt_updates if upd.get("type")]))
+            }
+            test_record["original_level"] = score_result["level"]
         
-        # Kullanıcı bilgilerini güncelle - test geçmişini de ekle
+        print(f"💾 Test record prepared: {test_record['test_type']} with {len(detailed_results)} detailed results")
+        
+        # ⭐ CRITICAL FIX: USER GÜNCELLEME - test_history dahil
         try:
-            # Önce mevcut test geçmişini al - ObjectId ile arama ekle
             user = user_collection.find_one({"_id": submission.user_id})
-            
-            # String ID ile bulunamadıysa ObjectId ile dene
             if not user:
                 try:
                     obj_id = ObjectId(submission.user_id)
                     user = user_collection.find_one({"_id": obj_id})
                     if user:
-                        print(f"✅ Kullanıcı ObjectId ile bulundu: {submission.user_id}")
-                        # Artık ObjectId ile çalışacağız
                         submission.user_id = obj_id
                 except:
-                    print(f"❌ ObjectId dönüşümü başarısız: {submission.user_id}")
+                    pass
             
             if not user:
-                print(f"❌ Kullanıcı bulunamadı: {submission.user_id}")
-                raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
+                print(f"❌ User not found: {submission.user_id}")
+                raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
             
-            print(f"✅ Kullanıcı bulundu: {user.get('name', 'İsimsiz')}")
-            
+            # ⭐ Test history güncelleme
             test_history = user.get("test_history", [])
-            print(f"📊 Mevcut test geçmişi uzunluğu: {len(test_history)}")
-            
-            # Yeni test sonucunu ekle
             test_history.append(test_record)
-            print(f"➕ Yeni test eklendi, toplam: {len(test_history)}")
             
-            # Sadece son 10 testi sakla (çok fazla büyümesin)
-            if len(test_history) > 10:
-                test_history = test_history[-10:]
-                print(f"✂️ Test geçmişi kırpıldı, yeni uzunluk: {len(test_history)}")
+            # Son 10 test sakla
+            #if len(test_history) > 10:
+            #    test_history = test_history[-10:]
             
-            # Kullanıcıyı güncelle
+            # User güncelleme
+            update_data = {
+                "test_score": score_result["score"],
+                "level": final_level,
+                "test_history": test_history,  # ⭐ Test history mutlaka dahil
+                "last_test_date": datetime.datetime.now()
+            }
+            
+            if bkt_updates:
+                update_data["bkt_level"] = final_level
+                update_data["last_bkt_update"] = datetime.datetime.now()
+            
             update_result = user_collection.update_one(
-                {"_id": submission.user_id},  # Artık ObjectId olabilir
-                {"$set": {
-                    "test_score": score_result["score"], 
-                    "level": score_result["level"],
-                    "test_history": test_history,
-                    "last_test_date": datetime.datetime.utcnow()
-                }}
+                {"_id": submission.user_id},
+                {"$set": update_data}
             )
             
-            print(f"✅ Kullanıcı güncellendi: {update_result.modified_count} kayıt")
-            
-            if update_result.modified_count == 0:
-                print("⚠️ Hiçbir kayıt güncellenmedi!")
+            print(f"✅ User updated: modified_count={update_result.modified_count}")
+            print(f"✅ Test history updated: {len(test_history)} tests in history")
             
         except Exception as user_update_error:
-            print(f"❌ Kullanıcı güncelleme hatası: {str(user_update_error)}")
+            print(f"❌ User update error: {str(user_update_error)}")
             import traceback
-            print(f"🔍 Hata detayı: {traceback.format_exc()}")
-            # Hatayı yine de devam ettir
+            print(traceback.format_exc())
         
-        # API yanıtını döndür
-        return {
+        # API RESPONSE
+        response = {
             "status": "success",
             "score": score_result["score"],
-            "level": score_result["level"],
+            "level": final_level,
             "correct_count": score_result["correct_count"],
-            "total_questions": len(submission.answers),
+            "total_questions": len(questions),  # ⭐ Gerçek soru sayısı
             "results": score_result["results"],
-            "detailed_results": detailed_results  # Frontend için detaylı sonuçlar
+            "detailed_results": detailed_results  # ⭐ ESKİ FORMAT
         }
-    
-    except Exception as e:
-        import traceback
-        print(f"Test değerlendirme hatası: {str(e)}")
-        print(traceback.format_exc())
         
-        raise HTTPException(status_code=500, detail=f"Test değerlendirme sırasında hata: {str(e)}")
-
+        # BKT bilgileri varsa ekle
+        if bkt_updates:
+            response["bkt_enhanced"] = True
+            response["original_level"] = score_result["level"]
+            response["bkt_analysis"] = {
+                "overall_mastery": overall_mastery,
+                "type_improvements": len(bkt_updates),
+                "weak_types": weak_types_summary[:3]
+            }
+        
+        print(f"🎉 Test submission completed successfully")
+        return response
+        
+    except Exception as e:
+        print(f"❌ Test submission error: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"테스트 평가 중 오류: {str(e)}")
 
 # Retrieve user test history endpoint
 @exam_router.get("/user-test-history/{user_id}")
@@ -858,3 +926,411 @@ async def get_questions(collection_name: str, limit: int = 20, skip: int = 0):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Veri çekme işlemi sırasında hata: {str(e)}")
+    
+@exam_router.post("/submit-test-with-type-bkt")
+async def submit_test_with_type_bkt(submission: TestSubmission):
+    """
+    TYPE 기반 BKT 통합 테스트 제출
+    """
+    try:
+        collection = db["diagnosis_test"]
+        user_collection = db["users"]
+        
+        print(f"🔍 TYPE-Based BKT Test Submission: user_id={submission.user_id}")
+        
+        # 기존 점수 계산
+        questions = []
+        bkt_updates = []
+        
+        for question_id, student_answer in submission.answers.items():
+            # 문제 찾기
+            question = collection.find_one({"_id": question_id})
+            if not question:
+                try:
+                    obj_id = ObjectId(question_id)
+                    question = collection.find_one({"_id": obj_id})
+                except:
+                    pass
+            
+            if question:
+                questions.append(question)
+                
+                # 정답 확인
+                correct_answer = question.get("Answer Key", question.get("answer_key"))
+                is_correct = student_answer == correct_answer
+                
+                # BKT 업데이트 - TYPE 기반으로 단순화!
+                try:
+                    bkt_result = bkt_system.update_bkt_with_answer(
+                        user_id=submission.user_id,
+                        question_data={
+                            "type": question.get("type", "general"),  # 전문가가 결정한 유형
+                            "difficulty": question.get("difficulty", "중"),
+                            "_id": question_id
+                        },
+                        student_answer=student_answer,
+                        is_correct=is_correct
+                    )
+                    bkt_updates.append(bkt_result)
+                    
+                    print(f"✅ BKT Updated: {bkt_result['type']} → {bkt_result['updated_mastery']:.3f}")
+                    
+                except Exception as bkt_error:
+                    print(f"⚠️ BKT update failed for question {question_id}: {str(bkt_error)}")
+        
+        # 기존 점수 계산
+        score_result = utils.real_calculate_score(submission.answers, questions)
+        
+        # BKT 마스터리 리포트
+        try:
+            mastery_report = bkt_system.get_mastery_report(submission.user_id)
+            overall_mastery = mastery_report["overall_mastery"]
+            
+            # BKT 기반 레벨 조정 (TYPE 기반)
+            combined_score = (score_result["score"] * 0.7) + (overall_mastery * 100 * 0.3)
+            
+            if combined_score >= 75:
+                bkt_adjusted_level = "상"
+            elif combined_score >= 55:
+                bkt_adjusted_level = "중"
+            else:
+                bkt_adjusted_level = "하"
+            
+            print(f"📊 TYPE-BKT Adjustment: Score={score_result['score']}, Mastery={overall_mastery:.3f}, Final={combined_score:.1f}, Level={bkt_adjusted_level}")
+            
+        except Exception as mastery_error:
+            print(f"⚠️ Mastery calculation failed: {str(mastery_error)}")
+            mastery_report = None
+            bkt_adjusted_level = score_result["level"]
+        
+        # 테스트 기록 (TYPE 기반 BKT 정보 포함)
+        test_record = {
+            "test_date": datetime.datetime.now(),
+            "test_type": "level_test_with_type_bkt",
+            "total_score": score_result["score"],
+            "level": bkt_adjusted_level,
+            "original_level": score_result["level"],
+            "correct_count": score_result["correct_count"],
+            "total_questions": len(submission.answers),
+            "bkt_analysis": {
+                "overall_mastery": mastery_report["overall_mastery"] if mastery_report else 0,
+                "type_updates": len(bkt_updates),
+                "weak_types": mastery_report["weak_types"] if mastery_report else [],
+                "strong_types": mastery_report["strong_types"] if mastery_report else [],
+                "total_types_tracked": mastery_report["total_types_tracked"] if mastery_report else 0
+            }
+        }
+        
+        # 사용자 정보 업데이트
+        try:
+            user = user_collection.find_one({"_id": submission.user_id})
+            if not user:
+                try:
+                    obj_id = ObjectId(submission.user_id)
+                    user = user_collection.find_one({"_id": obj_id})
+                    if user:
+                        submission.user_id = obj_id
+                except:
+                    pass
+            
+            if not user:
+                raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
+            
+            test_history = user.get("test_history", [])
+            test_history.append(test_record)
+            
+            #if len(test_history) > 10:
+            #    test_history = test_history[-10:]
+            
+            # BKT 조정된 정보로 업데이트
+            update_result = user_collection.update_one(
+                {"_id": submission.user_id},
+                {"$set": {
+                    "test_score": score_result["score"],
+                    "level": bkt_adjusted_level,
+                    "bkt_level": bkt_adjusted_level,
+                    "test_history": test_history,
+                    "last_test_date": datetime.datetime.now(),
+                    "last_bkt_update": datetime.datetime.now()
+                }}
+            )
+            
+            print(f"✅ User updated with TYPE-BKT level: {bkt_adjusted_level}")
+            
+        except Exception as user_update_error:
+            print(f"❌ 사용자 업데이트 오류: {str(user_update_error)}")
+        
+        # API 응답 (TYPE 기반 BKT 정보)
+        weak_types_summary = []
+        if mastery_report and mastery_report["weak_types"]:
+            for type_name, type_data in mastery_report["weak_types"]:
+                weak_types_summary.append({
+                    "type": type_name,
+                    "mastery": type_data["mastery_probability"],
+                    "level": type_data["level"]
+                })
+        
+        return {
+            "status": "success",
+            "score": score_result["score"],
+            "level": bkt_adjusted_level,
+            "original_level": score_result["level"],
+            "correct_count": score_result["correct_count"],
+            "total_questions": len(submission.answers),
+            "results": score_result["results"],
+            "bkt_enhanced": True,
+            "bkt_analysis": {
+                "overall_mastery": mastery_report["overall_mastery"] if mastery_report else 0,
+                "total_types_tracked": mastery_report["total_types_tracked"] if mastery_report else 0,
+                "type_improvements": len(bkt_updates),
+                "weak_types": weak_types_summary[:3],  # 가장 약한 3개 유형
+                "level_adjusted": bkt_adjusted_level != score_result["level"]
+            }
+        }
+    
+    except Exception as e:
+        print(f"❌ TYPE-BKT test error: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"테스트 평가 중 오류: {str(e)}")
+
+@exam_router.get("/adaptive-test-by-type/{user_id}")
+async def get_adaptive_test_by_type(user_id: str, num_questions: int = 10):
+    """
+    문제 TYPE 기반 적응형 테스트
+    """
+    try:
+        # 사용자의 약한 type들 가져오기
+        weak_types = bkt_system.get_weak_types(user_id)
+        
+        if not weak_types:
+            # 약한 유형이 없으면 랜덤 문제
+            return await get_random_test_questions(num_questions)
+        
+        print(f"🎯 Creating TYPE-based adaptive test for {user_id}")
+        print(f"   Weak types: {[t['type'] for t in weak_types]}")
+        
+        adaptive_questions = []
+        collections = ["all_questions"]
+        
+        # 가장 약한 type들에 집중해서 문제 선별
+        for type_info in weak_types:  # 상위 3개 약한 유형
+            question_type = type_info["type"]
+            mastery = type_info["mastery"]
+            
+            # 마스터리에 따른 난이도 결정
+            if mastery < 0.3:
+                target_difficulty = "하"
+            elif mastery < 0.5:
+                target_difficulty = "중"
+            else:
+                target_difficulty = "상"
+            
+            # 각 컬렉션에서 해당 type+난이도 문제 찾기
+            for collection_name in collections:
+                if len(adaptive_questions) >= num_questions:
+                    break
+                
+                collection = db[collection_name]
+                
+                # type과 난이도로 검색
+                query = {
+                    "type": question_type,
+                    "difficulty": target_difficulty
+                }
+                
+                questions = list(collection.find(query).limit(3))
+                
+                for question in questions:
+                    if len(adaptive_questions) >= num_questions:
+                        break
+                    
+                    # ObjectId를 string으로 변환
+                    if '_id' in question and not isinstance(question['_id'], str):
+                        question['_id'] = str(question['_id'])
+                    
+                    # 필드 표준화
+                    if 'Choices' not in question and 'choices' in question:
+                        question['Choices'] = question['choices']
+                    if 'Problem' not in question and 'problem' in question:
+                        question['Problem'] = question['problem']
+                    if 'Answer Key' not in question and 'answer_key' in question:
+                        question['Answer Key'] = question['answer_key']
+                    
+                    # BKT 메타데이터 추가
+                    question['bkt_metadata'] = {
+                        "target_type": question_type,
+                        "current_mastery": mastery,
+                        "adaptive_difficulty": target_difficulty,
+                        "reason": f"약한 유형 ({question_type}) 개선"
+                    }
+                    
+                    adaptive_questions.append(question)
+        
+        # 문제가 부족하면 다른 type의 문제로 채우기
+        if len(adaptive_questions) < num_questions:
+            remaining_needed = num_questions - len(adaptive_questions)
+            
+            for collection_name in collections:
+                if len(adaptive_questions) >= num_questions:
+                    break
+                
+                collection = db[collection_name]
+                
+                # 아직 사용되지 않은 type들에서 문제 가져오기
+                used_types = [q.get('bkt_metadata', {}).get('target_type') for q in adaptive_questions]
+                
+                additional_questions = list(collection.aggregate([
+                    {"$match": {"type": {"$nin": used_types}}},
+                    {"$sample": {"size": remaining_needed}}
+                ]))
+                
+                for question in additional_questions:
+                    if len(adaptive_questions) >= num_questions:
+                        break
+                    
+                    if '_id' in question and not isinstance(question['_id'], str):
+                        question['_id'] = str(question['_id'])
+                    
+                    # 필드 표준화
+                    if 'Choices' not in question and 'choices' in question:
+                        question['Choices'] = question['choices']
+                    if 'Problem' not in question and 'problem' in question:
+                        question['Problem'] = question['problem']
+                    if 'Answer Key' not in question and 'answer_key' in question:
+                        question['Answer Key'] = question['answer_key']
+                    
+                    question['bkt_metadata'] = {
+                        "target_type": question.get("type", "general"),
+                        "current_mastery": 0.5,
+                        "adaptive_difficulty": question.get("difficulty", "중"),
+                        "reason": "다양한 유형 보충"
+                    }
+                    
+                    adaptive_questions.append(question)
+        
+        # 문제 섞기
+        import random
+        random.shuffle(adaptive_questions)
+        adaptive_questions = adaptive_questions[:num_questions]
+        
+        # 타겟 type 요약
+        target_types = list(set([q.get('bkt_metadata', {}).get('target_type', 'general') 
+                               for q in adaptive_questions]))
+        
+        return {
+            "status": "success",
+            "adaptive_test": adaptive_questions,
+            "test_info": {
+                "total_questions": len(adaptive_questions),
+                "is_adaptive": True,
+                "target_types": target_types,
+                "weak_types_addressed": [t['type'] for t in weak_types],
+                "user_bkt_summary": {
+                    "total_types_tracked": len(weak_types),
+                    "weak_types_count": len([t for t in weak_types if t['mastery'] < 0.5]),
+                    "mastered_types_count": len([t for t in weak_types if t['mastery'] >= 0.8])
+                }
+            }
+        }
+    
+    except Exception as e:
+        print(f"❌ TYPE-based adaptive test error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"적응형 테스트 생성 중 오류: {str(e)}")
+
+@exam_router.get("/debug/question-types/{collection_name}")
+async def debug_question_types(collection_name: str):
+    """디버그: 특정 컬렉션의 문제 유형 분석"""
+    try:
+        if collection_name not in ["diagnosis_test", "exam_questions"]:
+            raise HTTPException(status_code=400, detail="Invalid collection name")
+        
+        collection = db[collection_name]
+        
+        # type 필드 분석
+        pipeline = [
+            {"$group": {
+                "_id": "$type",
+                "count": {"$sum": 1},
+                "difficulties": {"$addToSet": "$difficulty"},
+                "sample_problems": {"$push": {"$substr": ["$Problem", 0, 50]}}
+            }},
+            {"$sort": {"count": -1}}
+        ]
+        
+        type_analysis = list(collection.aggregate(pipeline))
+        
+        # 각 type의 샘플 문제 제한 (너무 많으면 3개만)
+        for item in type_analysis:
+            if len(item["sample_problems"]) > 3:
+                item["sample_problems"] = item["sample_problems"][:3]
+        
+        total_questions = collection.count_documents({})
+        questions_with_type = collection.count_documents({"type": {"$exists": True, "$ne": None}})
+        
+        return {
+            "status": "success",
+            "collection": collection_name,
+            "total_questions": total_questions,
+            "questions_with_type": questions_with_type,
+            "type_coverage": f"{questions_with_type/total_questions*100:.1f}%" if total_questions > 0 else "0%",
+            "type_analysis": type_analysis,
+            "unique_types_count": len(type_analysis)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
+
+async def get_random_test_questions(num_questions: int):
+    """랜덤 테스트 문제 (fallback)"""
+    try:
+        collections = ["diagnosis_test", "exam_questions"]
+        random_questions = []
+        
+        for collection_name in collections:
+            if len(random_questions) >= num_questions:
+                break
+            
+            collection = db[collection_name]
+            questions = list(collection.aggregate([
+                {"$sample": {"size": num_questions}}
+            ]))
+            
+            for question in questions:
+                if len(random_questions) >= num_questions:
+                    break
+                
+                if '_id' in question and not isinstance(question['_id'], str):
+                    question['_id'] = str(question['_id'])
+                
+                # 표준화
+                if 'Choices' not in question and 'choices' in question:
+                    question['Choices'] = question['choices']
+                if 'Problem' not in question and 'problem' in question:
+                    question['Problem'] = question['problem']
+                if 'Answer Key' not in question and 'answer_key' in question:
+                    question['Answer Key'] = question['answer_key']
+                
+                question['bkt_metadata'] = {
+                    "target_type": question.get("type", "general"),
+                    "current_mastery": 0.5,
+                    "adaptive_difficulty": question.get("difficulty", "중"),
+                    "reason": "랜덤 문제 (BKT 데이터 부족)"
+                }
+                
+                random_questions.append(question)
+        
+        return {
+            "status": "success",
+            "adaptive_test": random_questions,
+            "test_info": {
+                "total_questions": len(random_questions),
+                "is_adaptive": False,
+                "target_types": [],
+                "note": "충분한 BKT 데이터가 없어 랜덤 문제를 제공합니다."
+            }
+        }
+    
+    except Exception as e:
+        print(f"❌ Random test generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"랜덤 테스트 생성 중 오류: {str(e)}")    

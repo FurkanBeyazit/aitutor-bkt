@@ -130,3 +130,33 @@ def merge_and_save(questions, answers=None, collection_name="exam_questions", se
         "selected_session": selected_session
     }
     return api_request("exam/merge-and-save", method="POST", data=data)
+
+def get_type_based_bkt_report(user_id):
+    """TYPE 기반 BKT 마스터리 리포트"""
+    return api_request(f"bkt/mastery-report/{user_id}")
+
+def get_weak_types(user_id, threshold=0.6):
+    """약한 문제 유형들"""
+    return api_request(f"bkt/weak-types/{user_id}?threshold={threshold}")
+
+def get_type_summary(user_id):
+    """유형별 요약"""
+    return api_request(f"bkt/type-summary/{user_id}")
+
+def get_available_types():
+    """사용 가능한 문제 유형들"""
+    return api_request("bkt/available-types")
+
+def get_adaptive_test_by_type(user_id, num_questions=10):
+    """유형별 적응형 테스트"""
+    return api_request(f"exam/adaptive-test-by-type/{user_id}?num_questions={num_questions}")
+
+def update_type_based_bkt(user_id, question_data, student_answer, is_correct):
+    """TYPE 기반 BKT 지식 상태 업데이트"""
+    data = {
+        "user_id": user_id,
+        "question_data": question_data,  # type, difficulty 포함
+        "student_answer": student_answer,
+        "is_correct": is_correct
+    }
+    return api_request("bkt/update-knowledge", method="POST", data=data)

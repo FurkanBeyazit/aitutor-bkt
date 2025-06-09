@@ -192,7 +192,7 @@ def show_current_question(question, question_index, total_questions):
     # 현재 선택된 답변 가져오기
     current_answer = st.session_state.current_answers.get(question_id, None)
     
-    # 선택지 표시 - RADIO BUTTON 방식으로 변경하여 selection tracking 보장
+    # 선택지 표시 - None index로 시작하여 강제 선택 방지
     if choices and len(choices) > 0:
         st.markdown("### 선택지")
         
@@ -201,16 +201,16 @@ def show_current_question(question, question_index, total_questions):
         if current_answer is not None:
             selected_index = current_answer - 1  # 1-based to 0-based
             
-        # Radio button ile seçim yap
+        # Radio button ile seçim yap - UNIQUE KEY 및 None 기본값
         choice_options = [f"{i + 1}. {choice}" for i, choice in enumerate(choices)]
         
-        # UNIQUE KEY BURDADA DEĞİŞTİRİLDİ
         radio_key = f"question_radio_{question_index}_{question_id}"
         
+        # ⭐ CRITICAL FIX: index=None 으로 설정하여 강제 선택 방지
         selected_choice = st.radio(
             "답을 선택하세요:",
             choice_options,
-            index=selected_index,  # Previously selected option (or None)
+            index=selected_index,  # None이면 아무것도 선택되지 않음
             key=radio_key
         )
         
@@ -225,6 +225,10 @@ def show_current_question(question, question_index, total_questions):
                 st.session_state.current_answers[question_id] = answer_value
                 print(f"🔍 [DEBUG] Answer updated: {answer_value} for question {question_id}")
                 st.success(f"✅ 선택지 {answer_value}번이 선택되었습니다!")
+        
+        # Eğer hiçbir seçim yoksa uyarı göster
+        if current_answer is None:
+            st.info("🔍 아직 답을 선택하지 않았습니다.")
             
     else:
         st.error("이 문제의 선택지를 찾을 수 없습니다.")
@@ -402,19 +406,25 @@ def auto_submit_test():
     submit_final_test()
 
 def submit_final_test():
-    """최종 답변 제출"""
+    """최종 답변 제출 - 수정된 버전"""
     with st.spinner("테스트 답변을 평가 중..."):
         user_id = st.session_state.user.get("user_id")
-        answers = st.session_state.current_answers
+        answers = st.session_state.current_answers.copy()  # 복사본 생성
         
-        # 답변되지 않은 문제들을 기본값(1)으로 채우기
+        # ⭐ CRITICAL FIX: 답변되지 않은 문제들은 기본값으로 채우지 말고 그대로 두기
         test = st.session_state.current_test
+        unanswered_questions = []
+        
         for question in test:
             question_id = question.get("_id")
             if question_id not in answers:
-                answers[question_id] = 1  # 기본값으로 1번 선택
+                unanswered_questions.append(question_id)
+                # 기본값 설정하지 않음 - API에서 처리하도록 함
         
-        # API에 제출
+        if unanswered_questions:
+            print(f"🔍 [DEBUG] Unanswered questions: {len(unanswered_questions)}")
+        
+        # API에 제출 - 답변된 문제들만 보냄
         result = submit_test(user_id, answers)
         
         if result and result.get("status") == "success":
